@@ -1,0 +1,900 @@
+From f8e6e2c046e1015697356ee7079fb39e0cb6add5 Mon Sep 17 00:00:00 2001
+From: Immad Mir <mirimmad@outlook.com>
+Date: Sat, 23 Jul 2022 10:44:23 +0530
+Subject: [PATCH] Adding three new function attributes for static analysis of
+ file descriptors
+
+This patch adds three new function attributes to GCC that
+are used for static analysis of usage of file descriptors:
+
+1) __attribute__ ((fd_arg(N))): The attributes may be applied to a function that
+takes an open file descriptor at refrenced argument N.
+
+It indicates that the passed filedescriptor must not have been closed.
+Therefore, when the analyzer is enabled with -fanalyzer, the
+analyzer may emit a -Wanalyzer-fd-use-after-close diagnostic
+if it detects a code path in which a function with this attribute is
+called with a closed file descriptor.
+
+The attribute also indicates that the file descriptor must have been checked for
+validity before usage. Therefore, analyzer may emit
+-Wanalyzer-fd-use-without-check diagnostic if it detects a code path in
+which a function with this attribute is called with a file descriptor that has
+not been checked for validity.
+
+2) __attribute__((fd_arg_read(N))): The attribute is identical to
+fd_arg, but with the additional requirement that it might read from
+the file descriptor, and thus, the file descriptor must not have been opened
+as write-only.
+
+The analyzer may emit a -Wanalyzer-access-mode-mismatch
+diagnostic if it detects a code path in which a function with this
+attribute is called on a file descriptor opened with O_WRONLY.
+
+3) __attribute__((fd_arg_write(N))): The attribute is identical to fd_arg_read
+except that the analyzer may emit a -Wanalyzer-access-mode-mismatch diagnostic if
+it detects a code path in which a function with this attribute is called on a
+file descriptor opened with O_RDONLY.
+
+gcc/analyzer/ChangeLog:
+	* sm-fd.cc (fd_param_diagnostic): New diagnostic class.
+	(fd_access_mode_mismatch): Change inheritance from fd_diagnostic
+	to fd_param_diagnostic. Add new overloaded constructor.
+	(fd_use_after_close): Likewise.
+	(unchecked_use_of_fd): Likewise and also change name to fd_use_without_check.
+	(double_close): Change name to fd_double_close.
+	(enum access_directions): New.
+	(fd_state_machine::on_stmt): Handle calls to function with the
+	new three function attributes.
+	(fd_state_machine::check_for_fd_attrs): New.
+	(fd_state_machine::on_open): Use the new overloaded constructors
+	of diagnostic classes.
+
+gcc/c-family/ChangeLog:
+	* c-attribs.cc: (c_common_attribute_table): add three new attributes
+	namely: fd_arg, fd_arg_read and fd_arg_write.
+	(handle_fd_arg_attribute): New.
+
+gcc/ChangeLog:
+	* doc/extend.texi: Add fd_arg, fd_arg_read and fd_arg_write under
+	"Common Function Attributes" section.
+	* doc/invoke.texi: Add docs to -Wanalyzer-fd-access-mode-mismatch,
+	-Wanalyzer-use-after-close, -Wanalyzer-fd-use-without-check that these
+	warnings may be emitted through usage of three function attributes used
+	for static analysis of file descriptors namely fd_arg, fd_arg_read and
+	fd_arg_write.
+
+gcc/testsuite/ChangeLog:
+	* gcc.dg/analyzer/fd-5.c: New test.
+	* gcc.dg/analyzer/fd-4.c: Remove quotes around 'read-only' and
+	'write-only'.
+	* c-c++-common/attr-fd.c: New test.
+
+Signed-off-by: Immad Mir <mirimmad17@gmail.com>
+---
+ gcc/analyzer/sm-fd.cc                | 338 +++++++++++++++++++++------
+ gcc/c-family/c-attribs.cc            |  31 +++
+ gcc/doc/extend.texi                  |  37 +++
+ gcc/doc/invoke.texi                  |  18 +-
+ gcc/testsuite/c-c++-common/attr-fd.c |  18 ++
+ gcc/testsuite/gcc.dg/analyzer/fd-4.c |   8 +-
+ gcc/testsuite/gcc.dg/analyzer/fd-5.c |  53 +++++
+ 7 files changed, 429 insertions(+), 74 deletions(-)
+ create mode 100644 gcc/testsuite/c-c++-common/attr-fd.c
+ create mode 100644 gcc/testsuite/gcc.dg/analyzer/fd-5.c
+
+diff --git a/gcc/analyzer/sm-fd.cc b/gcc/analyzer/sm-fd.cc
+index 8e4300b06e24..c3dac48509e0 100644
+--- a/gcc/analyzer/sm-fd.cc
++++ b/gcc/analyzer/sm-fd.cc
+@@ -39,10 +39,13 @@ along with GCC; see the file COPYING3.  If not see
+ #include "analyzer/analyzer-selftests.h"
+ #include "tristate.h"
+ #include "selftest.h"
++#include "stringpool.h"
++#include "attribs.h"
+ #include "analyzer/call-string.h"
+ #include "analyzer/program-point.h"
+ #include "analyzer/store.h"
+ #include "analyzer/region-model.h"
++#include "bitmap.h"
+ 
+ #if ENABLE_ANALYZER
+ 
+@@ -59,6 +62,13 @@ enum access_mode
+   WRITE_ONLY
+ };
+ 
++enum access_directions
++{
++  DIRS_READ_WRITE,
++  DIRS_READ,
++  DIRS_WRITE
++};
++
+ class fd_state_machine : public state_machine
+ {
+ public:
+@@ -146,7 +156,7 @@ private:
+   void check_for_open_fd (sm_context *sm_ctxt, const supernode *node,
+                           const gimple *stmt, const gcall *call,
+                           const tree callee_fndecl,
+-                          enum access_direction access_fn) const;
++                          enum access_directions access_fn) const;
+ 
+   void make_valid_transitions_on_condition (sm_context *sm_ctxt,
+                                             const supernode *node,
+@@ -156,6 +166,10 @@ private:
+                                               const supernode *node,
+                                               const gimple *stmt,
+                                               const svalue *lhs) const;
++  void check_for_fd_attrs (sm_context *sm_ctxt, const supernode *node,
++                           const gimple *stmt, const gcall *call,
++                           const tree callee_fndecl, const char *attr_name,
++                           access_directions fd_attr_access_dir) const;
+ };
+ 
+ /* Base diagnostic class relative to fd_state_machine. */
+@@ -220,6 +234,70 @@ protected:
+   tree m_arg;
+ };
+ 
++class fd_param_diagnostic : public fd_diagnostic
++{
++public:
++  fd_param_diagnostic (const fd_state_machine &sm, tree arg, tree callee_fndecl,
++                       const char *attr_name, int arg_idx)
++      : fd_diagnostic (sm, arg), m_callee_fndecl (callee_fndecl),
++        m_attr_name (attr_name), m_arg_idx (arg_idx)
++  {
++  }
++
++  fd_param_diagnostic (const fd_state_machine &sm, tree arg, tree callee_fndecl)
++      : fd_diagnostic (sm, arg), m_callee_fndecl (callee_fndecl),
++        m_attr_name (NULL), m_arg_idx (-1)
++  {
++  }
++ 
++  bool
++  subclass_equal_p (const pending_diagnostic &base_other) const override
++  {
++    const fd_param_diagnostic &sub_other
++        = (const fd_param_diagnostic &)base_other;
++    return (same_tree_p (m_arg, sub_other.m_arg)
++            && same_tree_p (m_callee_fndecl, sub_other.m_callee_fndecl)
++            && m_arg_idx == sub_other.m_arg_idx
++            && ((m_attr_name)
++                    ? (strcmp (m_attr_name, sub_other.m_attr_name) == 0)
++                    : true));
++  }
++
++  void
++  inform_filedescriptor_attribute (access_directions fd_dir)
++  {
++
++    if (m_attr_name)
++      switch (fd_dir)
++        {
++        case DIRS_READ_WRITE:
++          inform (DECL_SOURCE_LOCATION (m_callee_fndecl),
++                  "argument %d of %qD must be an open file descriptor, due to "
++                  "%<__attribute__((%s(%d)))%>",
++                  m_arg_idx + 1, m_callee_fndecl, m_attr_name, m_arg_idx + 1);
++          break;
++        case DIRS_WRITE:
++          inform (DECL_SOURCE_LOCATION (m_callee_fndecl),
++                  "argument %d of %qD must be a readable file descriptor, due "
++                  "to %<__attribute__((%s(%d)))%>",
++                  m_arg_idx + 1, m_callee_fndecl, m_attr_name, m_arg_idx + 1);
++          break;
++        case DIRS_READ:
++          inform (DECL_SOURCE_LOCATION (m_callee_fndecl),
++                  "argument %d of %qD must be a writable file descriptor, due "
++                  "to %<__attribute__((%s(%d)))%>",
++                  m_arg_idx + 1, m_callee_fndecl, m_attr_name, m_arg_idx + 1);
++          break;
++        }
++  }
++
++protected:
++  tree m_callee_fndecl;
++  const char *m_attr_name;
++  /* ARG_IDX is 0-based. */
++  int m_arg_idx;
++};
++
+ class fd_leak : public fd_diagnostic
+ {
+ public:
+@@ -290,18 +368,26 @@ private:
+   diagnostic_event_id_t m_open_event;
+ };
+ 
+-class fd_access_mode_mismatch : public fd_diagnostic
++class fd_access_mode_mismatch : public fd_param_diagnostic
+ {
+ public:
+   fd_access_mode_mismatch (const fd_state_machine &sm, tree arg,
+-                           enum access_direction fd_dir,
+-                           const tree callee_fndecl)
+-      : fd_diagnostic (sm, arg), m_fd_dir (fd_dir),
+-        m_callee_fndecl (callee_fndecl)
++                           enum access_directions fd_dir,
++                           const tree callee_fndecl, const char *attr_name,
++                           int arg_idx)
++      : fd_param_diagnostic (sm, arg, callee_fndecl, attr_name, arg_idx),
++        m_fd_dir (fd_dir)
+ 
+   {
+   }
+ 
++  fd_access_mode_mismatch (const fd_state_machine &sm, tree arg,
++                           enum access_directions fd_dir,
++                           const tree callee_fndecl)
++      : fd_param_diagnostic (sm, arg, callee_fndecl), m_fd_dir (fd_dir)
++  {
++  }
++  
+   const char *
+   get_kind () const final override
+   {
+@@ -317,29 +403,25 @@ public:
+   bool
+   emit (rich_location *rich_loc) final override
+   {
++    bool warned;
+     switch (m_fd_dir)
+       {
+-      case DIR_READ:
+-        return warning_at (rich_loc, get_controlling_option (),
+-                           "%qE on %<read-only%> file descriptor %qE",
++      case DIRS_READ:
++        warned =  warning_at (rich_loc, get_controlling_option (),
++                           "%qE on read-only file descriptor %qE",
+                            m_callee_fndecl, m_arg);
+-      case DIR_WRITE:
+-        return warning_at (rich_loc, get_controlling_option (),
+-                           "%qE on %<write-only%> file descriptor %qE",
++        break;
++      case DIRS_WRITE:
++        warned = warning_at (rich_loc, get_controlling_option (),
++                           "%qE on write-only file descriptor %qE",
+                            m_callee_fndecl, m_arg);
++        break;
+       default:
+         gcc_unreachable ();
+       }
+-  }
+-
+-  bool
+-  subclass_equal_p (const pending_diagnostic &base_other) const override
+-  {
+-    const fd_access_mode_mismatch &sub_other
+-        = (const fd_access_mode_mismatch &)base_other;
+-    return (same_tree_p (m_arg, sub_other.m_arg)
+-            && m_callee_fndecl == sub_other.m_callee_fndecl
+-            && m_fd_dir == sub_other.m_fd_dir);
++      if (warned)
++        inform_filedescriptor_attribute (m_fd_dir);
++      return warned;
+   }
+ 
+   label_text
+@@ -347,11 +429,11 @@ public:
+   {
+     switch (m_fd_dir)
+       {
+-      case DIR_READ:
+-        return ev.formatted_print ("%qE on %<read-only%> file descriptor %qE",
++      case DIRS_READ:
++        return ev.formatted_print ("%qE on read-only file descriptor %qE",
+                                    m_callee_fndecl, m_arg);
+-      case DIR_WRITE:
+-        return ev.formatted_print ("%qE on %<write-only%> file descriptor %qE",
++      case DIRS_WRITE:
++        return ev.formatted_print ("%qE on write-only file descriptor %qE",
+                                    m_callee_fndecl, m_arg);
+       default:
+         gcc_unreachable ();
+@@ -359,21 +441,20 @@ public:
+   }
+ 
+ private:
+-  enum access_direction m_fd_dir;
+-  const tree m_callee_fndecl;
++  enum access_directions m_fd_dir;
+ };
+ 
+-class double_close : public fd_diagnostic
++class fd_double_close : public fd_diagnostic
+ {
+ public:
+-  double_close (const fd_state_machine &sm, tree arg) : fd_diagnostic (sm, arg)
++  fd_double_close (const fd_state_machine &sm, tree arg) : fd_diagnostic (sm, arg)
+   {
+   }
+ 
+   const char *
+   get_kind () const final override
+   {
+-    return "double_close";
++    return "fd_double_close";
+   }
+ 
+   int
+@@ -418,12 +499,19 @@ private:
+   diagnostic_event_id_t m_first_close_event;
+ };
+ 
+-class fd_use_after_close : public fd_diagnostic
++class fd_use_after_close : public fd_param_diagnostic
+ {
+ public:
++  fd_use_after_close (const fd_state_machine &sm, tree arg,
++                      const tree callee_fndecl, const char *attr_name,
++                      int arg_idx)
++      : fd_param_diagnostic (sm, arg, callee_fndecl, attr_name, arg_idx)
++  {
++  }
++
+   fd_use_after_close (const fd_state_machine &sm, tree arg,
+                       const tree callee_fndecl)
+-      : fd_diagnostic (sm, arg), m_callee_fndecl (callee_fndecl)
++      : fd_param_diagnostic (sm, arg, callee_fndecl)
+   {
+   }
+ 
+@@ -442,9 +530,13 @@ public:
+   bool
+   emit (rich_location *rich_loc) final override
+   {
+-    return warning_at (rich_loc, get_controlling_option (),
++    bool warned;
++    warned = warning_at (rich_loc, get_controlling_option (),
+                        "%qE on closed file descriptor %qE", m_callee_fndecl,
+                        m_arg);
++    if (warned)
++      inform_filedescriptor_attribute (DIRS_READ_WRITE);
++    return warned;
+   }
+ 
+   label_text
+@@ -466,32 +558,38 @@ public:
+   describe_final_event (const evdesc::final_event &ev) final override
+   {
+     if (m_first_close_event.known_p ())
+-      return ev.formatted_print (
+-          "%qE on closed file descriptor %qE; %qs was at %@", m_callee_fndecl,
+-          m_arg, "close", &m_first_close_event);
+-    else
+-      return ev.formatted_print ("%qE on closed file descriptor %qE",
+-                                 m_callee_fndecl, m_arg);
++        return ev.formatted_print (
++            "%qE on closed file descriptor %qE; %qs was at %@", m_callee_fndecl,
++            m_arg, "close", &m_first_close_event);
++      else
++        return ev.formatted_print ("%qE on closed file descriptor %qE",
++                                  m_callee_fndecl, m_arg);
+   }
+ 
+ private:
+   diagnostic_event_id_t m_first_close_event;
+-  const tree m_callee_fndecl;
+ };
+ 
+-class unchecked_use_of_fd : public fd_diagnostic
++class fd_use_without_check : public fd_param_diagnostic
+ {
+ public:
+-  unchecked_use_of_fd (const fd_state_machine &sm, tree arg,
+-                       const tree callee_fndecl)
+-      : fd_diagnostic (sm, arg), m_callee_fndecl (callee_fndecl)
++  fd_use_without_check (const fd_state_machine &sm, tree arg,
++                        const tree callee_fndecl, const char *attr_name,
++                        int arg_idx)
++      : fd_param_diagnostic (sm, arg, callee_fndecl, attr_name, arg_idx)
++  {
++  }
++
++  fd_use_without_check (const fd_state_machine &sm, tree arg,
++                        const tree callee_fndecl)
++      : fd_param_diagnostic (sm, arg, callee_fndecl)
+   {
+   }
+ 
+   const char *
+   get_kind () const final override
+   {
+-    return "unchecked_use_of_fd";
++    return "fd_use_without_check";
+   }
+ 
+   int
+@@ -503,18 +601,13 @@ public:
+   bool
+   emit (rich_location *rich_loc) final override
+   {
+-    return warning_at (rich_loc, get_controlling_option (),
+-                       "%qE on possibly invalid file descriptor %qE",
+-                       m_callee_fndecl, m_arg);
+-  }
+-
+-  bool
+-  subclass_equal_p (const pending_diagnostic &base_other) const override
+-  {
+-    const unchecked_use_of_fd &sub_other
+-        = (const unchecked_use_of_fd &)base_other;
+-    return (same_tree_p (m_arg, sub_other.m_arg)
+-            && m_callee_fndecl == sub_other.m_callee_fndecl);
++    bool warned;
++    warned = warning_at (rich_loc, get_controlling_option (),
++                        "%qE on possibly invalid file descriptor %qE",
++                        m_callee_fndecl, m_arg);
++    if (warned)
++     inform_filedescriptor_attribute (DIRS_READ_WRITE);
++    return warned;
+   }
+ 
+   label_text
+@@ -541,8 +634,7 @@ public:
+   }
+ 
+ private:
+-  diagnostic_event_id_t m_first_open_event;
+-  const tree m_callee_fndecl;
++  diagnostic_event_id_t m_first_open_event;  
+ };
+ 
+ fd_state_machine::fd_state_machine (logger *logger)
+@@ -647,11 +739,117 @@ fd_state_machine::on_stmt (sm_context *sm_ctxt, const supernode *node,
+             on_read (sm_ctxt, node, stmt, call, callee_fndecl);
+             return true;
+           } // "read"
++
++          
++        {
++          // Handle __attribute__((fd_arg))
++
++          check_for_fd_attrs (sm_ctxt, node, stmt, call, callee_fndecl,
++                              "fd_arg", DIRS_READ_WRITE);
++
++          // Handle __attribute__((fd_arg_read))
++
++          check_for_fd_attrs (sm_ctxt, node, stmt, call, callee_fndecl,
++                              "fd_arg_read", DIRS_READ);
++
++          // Handle __attribute__((fd_arg_write))
++
++          check_for_fd_attrs (sm_ctxt, node, stmt, call, callee_fndecl,
++                              "fd_arg_write", DIRS_WRITE);
++        }          
+       }
+ 
+   return false;
+ }
+ 
++void
++fd_state_machine::check_for_fd_attrs (
++    sm_context *sm_ctxt, const supernode *node, const gimple *stmt,
++    const gcall *call, const tree callee_fndecl, const char *attr_name,
++    access_directions fd_attr_access_dir) const
++{
++
++  tree attrs = TYPE_ATTRIBUTES (TREE_TYPE (callee_fndecl));
++  attrs = lookup_attribute (attr_name, attrs);
++  if (!attrs)
++    return;
++
++  if (!TREE_VALUE (attrs))
++    return;
++
++  auto_bitmap argmap;
++
++  for (tree idx = TREE_VALUE (attrs); idx; idx = TREE_CHAIN (idx))
++    {
++      unsigned int val = TREE_INT_CST_LOW (TREE_VALUE (idx)) - 1;
++      bitmap_set_bit (argmap, val);
++    }
++  if (bitmap_empty_p (argmap))
++    return;
++
++  for (unsigned arg_idx = 0; arg_idx < gimple_call_num_args (call); arg_idx++)
++    {
++      tree arg = gimple_call_arg (call, arg_idx);
++      tree diag_arg = sm_ctxt->get_diagnostic_tree (arg);
++      state_t state = sm_ctxt->get_state (stmt, arg);
++      bool bit_set = bitmap_bit_p (argmap, arg_idx);
++      if (TREE_CODE (TREE_TYPE (arg)) != INTEGER_TYPE)
++        continue;
++      if (bit_set) // Check if arg_idx is marked by any of the file descriptor
++                   // attributes
++        {
++
++          if (is_closed_fd_p (state))
++            {
++
++              sm_ctxt->warn (node, stmt, arg,
++                             new fd_use_after_close (*this, diag_arg,
++                                                     callee_fndecl, attr_name,
++                                                     arg_idx));
++              continue;
++            }
++
++          if (!(is_valid_fd_p (state) || (state == m_stop)))
++            {
++              if (!is_constant_fd_p (state))
++                sm_ctxt->warn (node, stmt, arg,
++                               new fd_use_without_check (*this, diag_arg,
++                                                        callee_fndecl, attr_name,
++                                                        arg_idx));
++            }
++
++          switch (fd_attr_access_dir)
++            {
++            case DIRS_READ_WRITE:
++              break;
++            case DIRS_READ:
++
++              if (is_writeonly_fd_p (state))
++                {
++                  sm_ctxt->warn (
++                      node, stmt, arg,
++                      new fd_access_mode_mismatch (*this, diag_arg, DIRS_WRITE,
++                                                   callee_fndecl, attr_name, arg_idx));
++                }
++
++              break;
++            case DIRS_WRITE:
++
++              if (is_readonly_fd_p (state))
++                {
++                  sm_ctxt->warn (
++                      node, stmt, arg,
++                      new fd_access_mode_mismatch (*this, diag_arg, DIRS_READ,
++                                                   callee_fndecl, attr_name, arg_idx));
++                }
++
++              break;
++            }
++        }
++    }
++}
++
++
+ void
+ fd_state_machine::on_open (sm_context *sm_ctxt, const supernode *node,
+                            const gimple *stmt, const gcall *call) const
+@@ -706,7 +904,7 @@ fd_state_machine::on_close (sm_context *sm_ctxt, const supernode *node,
+ 
+   if (is_closed_fd_p (state))
+     {
+-      sm_ctxt->warn (node, stmt, arg, new double_close (*this, diag_arg));
++      sm_ctxt->warn (node, stmt, arg, new fd_double_close (*this, diag_arg));
+       sm_ctxt->set_next_state (stmt, arg, m_stop);
+     }
+ }
+@@ -715,21 +913,21 @@ fd_state_machine::on_read (sm_context *sm_ctxt, const supernode *node,
+                            const gimple *stmt, const gcall *call,
+                            const tree callee_fndecl) const
+ {
+-  check_for_open_fd (sm_ctxt, node, stmt, call, callee_fndecl, DIR_READ);
++  check_for_open_fd (sm_ctxt, node, stmt, call, callee_fndecl, DIRS_READ);
+ }
+ void
+ fd_state_machine::on_write (sm_context *sm_ctxt, const supernode *node,
+                             const gimple *stmt, const gcall *call,
+                             const tree callee_fndecl) const
+ {
+-  check_for_open_fd (sm_ctxt, node, stmt, call, callee_fndecl, DIR_WRITE);
++  check_for_open_fd (sm_ctxt, node, stmt, call, callee_fndecl, DIRS_WRITE);
+ }
+ 
+ void
+ fd_state_machine::check_for_open_fd (
+     sm_context *sm_ctxt, const supernode *node, const gimple *stmt,
+     const gcall *call, const tree callee_fndecl,
+-    enum access_direction callee_fndecl_dir) const
++    enum access_directions callee_fndecl_dir) const
+ {
+   tree arg = gimple_call_arg (call, 0);
+   tree diag_arg = sm_ctxt->get_diagnostic_tree (arg);
+@@ -748,30 +946,32 @@ fd_state_machine::check_for_open_fd (
+           if (!is_constant_fd_p (state))
+             sm_ctxt->warn (
+                 node, stmt, arg,
+-                new unchecked_use_of_fd (*this, diag_arg, callee_fndecl));
++                new fd_use_without_check (*this, diag_arg, callee_fndecl));
+         }
+       switch (callee_fndecl_dir)
+         {
+-        case DIR_READ:
++        case DIRS_READ:
+           if (is_writeonly_fd_p (state))
+             {
+               tree diag_arg = sm_ctxt->get_diagnostic_tree (arg);
+               sm_ctxt->warn (node, stmt, arg,
+                              new fd_access_mode_mismatch (
+-                                 *this, diag_arg, DIR_WRITE, callee_fndecl));
++                                 *this, diag_arg, DIRS_WRITE, callee_fndecl));
+             }
+ 
+           break;
+-        case DIR_WRITE:
++        case DIRS_WRITE:
+ 
+           if (is_readonly_fd_p (state))
+             {
+               tree diag_arg = sm_ctxt->get_diagnostic_tree (arg);
+               sm_ctxt->warn (node, stmt, arg,
+                              new fd_access_mode_mismatch (
+-                                 *this, diag_arg, DIR_READ, callee_fndecl));
++                                 *this, diag_arg, DIRS_READ, callee_fndecl));
+             }
+           break;
++        default:
++          gcc_unreachable ();
+         }
+     }
+ }
+diff --git a/gcc/c-family/c-attribs.cc b/gcc/c-family/c-attribs.cc
+index c8d96723f4c3..e4f1d3542f37 100644
+--- a/gcc/c-family/c-attribs.cc
++++ b/gcc/c-family/c-attribs.cc
+@@ -173,6 +173,7 @@ static tree handle_objc_nullability_attribute (tree *, tree, tree, int, bool *);
+ static tree handle_signed_bool_precision_attribute (tree *, tree, tree, int,
+ 						    bool *);
+ static tree handle_retain_attribute (tree *, tree, tree, int, bool *);
++static tree handle_fd_arg_attribute (tree *, tree, tree, int, bool *);
+ 
+ /* Helper to define attribute exclusions.  */
+ #define ATTR_EXCL(name, function, type, variable)	\
+@@ -555,6 +556,12 @@ const struct attribute_spec c_common_attribute_table[] =
+ 			      handle_dealloc_attribute, NULL },
+   { "tainted_args",	      0, 0, true,  false, false, false,
+ 			      handle_tainted_args_attribute, NULL },
++  { "fd_arg",             1, 1, false, true, true, false,
++            handle_fd_arg_attribute, NULL},      
++  { "fd_arg_read",        1, 1, false, true, true, false,
++            handle_fd_arg_attribute, NULL},
++  { "fd_arg_write",       1, 1, false, true, true, false,
++            handle_fd_arg_attribute, NULL},         
+   { NULL,                     0, 0, false, false, false, false, NULL, NULL }
+ };
+ 
+@@ -4521,6 +4528,30 @@ handle_nonnull_attribute (tree *node, tree name,
+   return NULL_TREE;
+ }
+ 
++/* Handle the "fd_arg", "fd_arg_read" and "fd_arg_write" attributes */
++
++static tree
++handle_fd_arg_attribute (tree *node, tree name, tree args,
++                              int ARG_UNUSED (flags), bool *no_add_attrs)
++{
++  tree type = *node;
++  if (!args)
++    {
++      if (!prototype_p (type))
++        {
++          error ("%qE attribute without arguments on a non-prototype", name);
++          *no_add_attrs = true;
++        }
++      return NULL_TREE;
++    }
++
++  if (positional_argument (*node, name, TREE_VALUE (args), INTEGER_TYPE))
++      return NULL_TREE;
++
++  *no_add_attrs = true;  
++  return NULL_TREE;
++}
++
+ /* Handle the "nonstring" variable attribute.  */
+ 
+ static tree
+diff --git a/gcc/doc/extend.texi b/gcc/doc/extend.texi
+index 4222e7613029..71897b84a1b3 100644
+--- a/gcc/doc/extend.texi
++++ b/gcc/doc/extend.texi
+@@ -3007,6 +3007,43 @@ produced by @command{gold}.
+ For other linkers that cannot generate resolution file,
+ explicit @code{externally_visible} attributes are still necessary.
+ 
++@item fd_arg 
++@itemx fd_arg (@var{N})
++@cindex @code{fd_arg} function attribute
++The @code{fd_arg} attribute may be applied to a function that takes an open 
++file descriptor at referenced argument @var{N}.
++
++It indicates that the passed filedescriptor must not have been closed.
++Therefore, when the analyzer is enabled with @option{-fanalyzer}, the 
++analyzer may emit a @option{-Wanalyzer-fd-use-after-close} diagnostic 
++if it detects a code path in which a function with this attribute is
++called with a closed file descriptor.
++
++The attribute also indicates that the file descriptor must have been checked for
++validity before usage. Therefore, analyzer may emit
++@option{-Wanalyzer-fd-use-without-check} diagnostic if it detects a code path in
++which a function with this attribute is called with a file descriptor that has
++not been checked for validity.
++
++@item fd_arg_read
++@itemx fd_arg_read (@var{N})
++@cindex @code{fd_arg_read} function attribute
++The @code{fd_arg_read} is identical to @code{fd_arg}, but with the additional
++requirement that it might read from the file descriptor, and thus, the file
++descriptor must not have been opened as write-only.
++
++The analyzer may emit a @option{-Wanalyzer-access-mode-mismatch}
++diagnostic if it detects a code path in which a function with this
++attribute is called on a file descriptor opened with @code{O_WRONLY}.
++
++@item fd_arg_write
++@itemx fd_arg_write (@var{N})
++@cindex @code{fd_arg_write} function attribute
++The @code{fd_arg_write} is identical to @code{fd_arg_read} except that the
++analyzer may emit a @option{-Wanalyzer-access-mode-mismatch} diagnostic if 
++it detects a code path in which a function with this attribute is called on a 
++file descriptor opened with @code{O_RDONLY}.
++
+ @item flatten
+ @cindex @code{flatten} function attribute
+ Generally, inlining into a function is limited.  For a function marked with
+diff --git a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+index 94689be2801a..b1a9f50bfc73 100644
+--- a/gcc/doc/invoke.texi
++++ b/gcc/doc/invoke.texi
+@@ -9848,7 +9848,13 @@ This warning requires @option{-fanalyzer}, which enables it; use
+ to disable it.
+ 
+ This diagnostic warns for paths through code in which a 
+-@code{read} on a write-only file descriptor is attempted, or vice versa
++@code{read} on a write-only file descriptor is attempted, or vice versa.
++
++This diagnostic also warns for code paths in a which a function with attribute
++@code{fd_arg_read (N)} is called with a file descriptor opened with
++@code{O_WRONLY} at referenced argument @code{N} or a function with attribute
++@code{fd_arg_write (N)} is called with a file descriptor opened with
++@code{O_RDONLY} at referenced argument @var{N}.
+ 
+ @item -Wno-analyzer-fd-double-close
+ @opindex Wanalyzer-fd-double-close
+@@ -9880,6 +9886,11 @@ to disable it.
+ This diagnostic warns for paths through code in which a 
+ read or write is called on a closed file descriptor.
+ 
++This diagnostic also warns for paths through code in which
++a function with attribute @code{fd_arg (N)} or @code{fd_arg_read (N)}
++or @code{fd_arg_write (N)} is called with a closed file descriptor at
++referenced argument @code{N}.
++
+ @item -Wno-analyzer-fd-use-without-check
+ @opindex Wanalyzer-fd-use-without-check
+ @opindex Wno-analyzer-fd-use-without-check
+@@ -9890,6 +9901,11 @@ to disable it.
+ This diagnostic warns for paths through code in which a 
+ file descriptor is used without being checked for validity.
+ 
++This diagnostic also warns for paths through code in which
++a function with attribute @code{fd_arg (N)} or @code{fd_arg_read (N)}
++or @code{fd_arg_write (N)} is called with a file descriptor, at referenced
++argument @code{N}, without being checked for validity.
++
+ @item -Wno-analyzer-file-leak
+ @opindex Wanalyzer-file-leak
+ @opindex Wno-analyzer-file-leak
+diff --git a/gcc/testsuite/c-c++-common/attr-fd.c b/gcc/testsuite/c-c++-common/attr-fd.c
+new file mode 100644
+index 000000000000..e4bb4ed03748
+--- /dev/null
++++ b/gcc/testsuite/c-c++-common/attr-fd.c
+@@ -0,0 +1,18 @@
++
++int not_a_fn __attribute__ ((fd_arg(1))); /* { dg-warning "'fd_arg' attribute only applies to function types" } */
++
++void f (char *p) __attribute__ ((fd_arg(1))); /* { dg-warning "'fd_arg' attribute argument value '1' refers to parameter type 'char ?\\\*'" } */
++
++
++int not_a_fn_b __attribute__ ((fd_arg_read(1))); /* { dg-warning "'fd_arg_read' attribute only applies to function types" } */
++
++void g (char *p) __attribute__ ((fd_arg_read(1))); /* { dg-warning "'fd_arg_read' attribute argument value '1' refers to parameter type 'char ?\\\*'" } */
++
++
++int not_a_fn_c __attribute__ ((fd_arg_write(1))); /* { dg-warning "'fd_arg_write' attribute only applies to function types" } */
++
++void f (char *p) __attribute__ ((fd_arg_write(1))); /* { dg-warning "'fd_arg_write' attribute argument value '1' refers to parameter type 'char ?\\\*'" } */
++
++
++void fn_a (int fd) __attribute__ ((fd_arg(0))); /* { dg-warning "'fd_arg' attribute argument value '0' does not refer to a function parameter" } */
++void fd_a_1 (int fd) __attribute__ ((fd_arg("notint"))); /* { dg-warning "'fd_arg' attribute argument has type ('char\\\[7\\\]'|'const char\\\*')" } */
+diff --git a/gcc/testsuite/gcc.dg/analyzer/fd-4.c b/gcc/testsuite/gcc.dg/analyzer/fd-4.c
+index fcfa6168efae..41263468a6c1 100644
+--- a/gcc/testsuite/gcc.dg/analyzer/fd-4.c
++++ b/gcc/testsuite/gcc.dg/analyzer/fd-4.c
+@@ -17,9 +17,9 @@ test_1 (const char *path, void *buf)
+     if (fd >= 0) /* { dg-message "assuming 'fd' is a valid file descriptor \\(>= 0\\)" "event1" } */
+     /* { dg-message "following 'true' branch \\(when 'fd >= 0'\\)..." "event2" { target *-*-* } .-1 } */
+     {
+-        write (fd, buf, 1); /* { dg-warning "'write' on 'read-only' file descriptor 'fd'" "warning" } */
++        write (fd, buf, 1); /* { dg-warning "'write' on read-only file descriptor 'fd'" "warning" } */
+         /* { dg-message "\\(4\\) ...to here" "event1" { target *-*-* } .-1 } */
+-        /* { dg-message "\\(5\\) 'write' on 'read-only' file descriptor 'fd'" "event2" { target *-*-* } .-2 } */
++        /* { dg-message "\\(5\\) 'write' on read-only file descriptor 'fd'" "event2" { target *-*-* } .-2 } */
+         close (fd);
+     }
+ }
+@@ -31,9 +31,9 @@ test_2 (const char *path, void *buf)
+     if (fd >= 0) /* { dg-message "assuming 'fd' is a valid file descriptor \\(>= 0\\)" "event1" } */
+     /* { dg-message "following 'true' branch \\(when 'fd >= 0'\\)..." "event2" { target *-*-* } .-1 } */
+     {
+-        read (fd, buf, 1); /* { dg-warning "'read' on 'write-only' file descriptor 'fd'" "warning" } */
++        read (fd, buf, 1); /* { dg-warning "'read' on write-only file descriptor 'fd'" "warning" } */
+         /* { dg-message "\\(4\\) ...to here" "event1" { target *-*-* } .-1 } */
+-        /* { dg-message "\\(5\\) 'read' on 'write-only' file descriptor 'fd'" "event2" { target *-*-* } .-2 } */
++        /* { dg-message "\\(5\\) 'read' on write-only file descriptor 'fd'" "event2" { target *-*-* } .-2 } */
+         close (fd);
+     }
+ }
+diff --git a/gcc/testsuite/gcc.dg/analyzer/fd-5.c b/gcc/testsuite/gcc.dg/analyzer/fd-5.c
+new file mode 100644
+index 000000000000..8f29c11b3e81
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/analyzer/fd-5.c
+@@ -0,0 +1,53 @@
++int open(const char *, int mode);
++void close(int fd);
++int write (int fd, void *buf, int nbytes);
++int read (int fd, void *buf, int nbytes);
++
++#define O_RDONLY 0
++#define O_WRONLY 1
++#define O_RDWR 2
++
++void f (int fd) __attribute__((fd_arg(1))); /* { dg-message "argument 1 of 'f' must be an open file descriptor, due to '__attribute__\\(\\(fd_arg\\(1\\)\\)\\)'" } */
++
++void
++test_1 (const char *path)
++{
++    int fd = open (path, O_RDWR);
++    close(fd);
++    f(fd); /* { dg-warning "'f' on closed file descriptor 'fd'" } */
++      /* { dg-message "\\(3\\) 'f' on closed file descriptor 'fd'; 'close' was at \\(2\\)" "" { target *-*-* } .-1 } */
++}
++
++void g (int fd) __attribute__((fd_arg_read(1))); /* { dg-message "argument 1 of 'g' must be a readable file descriptor, due to '__attribute__\\(\\(fd_arg_read\\(1\\)\\)\\)'" } */
++
++void
++test_2 (const char *path)
++{
++  int fd = open (path, O_WRONLY);
++  if (fd != -1)
++  {
++    g (fd); /* { dg-warning "'g' on write-only file descriptor 'fd'" } */
++  }
++  close (fd);
++}
++
++void h (int fd) __attribute__((fd_arg_write(1))); /* { dg-message "argument 1 of 'h' must be a writable file descriptor, due to '__attribute__\\(\\(fd_arg_write\\(1\\)\\)\\)'" } */
++void
++test_3 (const char *path)
++{
++  int fd = open (path, O_RDONLY);
++  if (fd != -1)
++  {
++    h (fd); /* { dg-warning "'h' on read-only file descriptor 'fd'" } */
++  }
++  close(fd);
++}
++
++void ff (int fd) __attribute__((fd_arg(1))); /* { dg-message "argument 1 of 'ff' must be an open file descriptor, due to '__attribute__\\(\\(fd_arg\\(1\\)\\)\\)'" } */
++
++void test_4 (const char *path)
++{
++  int fd = open (path, O_RDWR);
++  ff (fd); /* { dg-warning "'ff' on possibly invalid file descriptor 'fd'" } */
++  close(fd);
++}
+\ No newline at end of file
+-- 
+2.43.5
+
